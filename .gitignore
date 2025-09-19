@@ -23,7 +23,6 @@ venv/
 
 
 #Logs
-*log
 *.log
 *.tmp
 *.bak
