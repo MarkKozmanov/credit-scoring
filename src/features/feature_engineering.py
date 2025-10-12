@@ -2,420 +2,440 @@ import pandas as pd
 import numpy as np
 import pickle
 from datetime import datetime
+from sklearn.model_selection import train_test_split
 from sklearn.neighbors import KNeighborsClassifier
+from sklearn.preprocessing import StandardScaler
 from xgboost import XGBRegressor
 
 
 class ApplicationDataPreprocessor:
     """
-    Препроцессор для datasets application_train и application_test.
-    Выполняет очистку данных, проектирование признаков и предобработку
-    специально для основных файлов с заявками.
+    Класс предобработки таблиц application_train.csv и application_test.csv.
+    Оставлена только логика, которая затрагивает исключительно эти два файла.
+
+    Методы:
+        - __init__
+        - load_dataframes
+        - data_cleaning
+        - ext_source_values_predictor
+        - numeric_feature_engineering
+        - neighbors_EXT_SOURCE_feature
+        - categorical_interaction_features
+        - response_fit
+        - response_transform
+        - main
     """
 
     def __init__(self, file_directory='', verbose=True, dump_to_pickle=False):
         """
-        Инициализация препроцессора.
+        Инициализация.
 
-        Аргументы:
-            file_directory: Путь к файлам данных (включая завершающий '/')
-            verbose: Флаг вывода сообщений о прогрессе
-            dump_to_pickle: Флаг сохранения обработанных данных в pickle файлы
+        Параметры:
+            file_directory (str): путь к csv файлам (заканчивается '/'), по умолчанию ''
+            verbose (bool): печатать лог или нет
+            dump_to_pickle (bool): сохранять ли в pickle результат
         """
+        self.file_directory = file_directory if file_directory is not None else ''
         self.verbose = verbose
         self.dump_to_pickle = dump_to_pickle
-        self.file_directory = file_directory
+        self.start = None
 
     def load_dataframes(self):
-        """Загрузка DataFrame application_train и application_test."""
+        """Загрузить application_train.csv и application_test.csv."""
         if self.verbose:
-            self.start_time = datetime.now()
+            self.start = datetime.now()
             print('#' * 60)
-            print('#      Предобработка данных заявок      #')
+            print('#   Загрузка application_train.csv и application_test.csv   #')
             print('#' * 60)
-            print("\nЗагрузка application_train.csv и application_test.csv...")
+            print("Загрузка в память...")
 
         self.application_train = pd.read_csv(self.file_directory + 'application_train.csv')
         self.application_test = pd.read_csv(self.file_directory + 'application_test.csv')
         self.initial_shape = self.application_train.shape
 
         if self.verbose:
-            print("DataFrame успешно загружены")
-            print(f"Время загрузки: {datetime.now() - self.start_time}")
+            print("Загружено.")
+            print(f"Время загрузки: {datetime.now() - self.start}")
 
     def data_cleaning(self):
-        """Выполнение операций очистки данных."""
+        """
+        Очистка данных: удаление бесполезных флагов, обработка DAYS_*, исправление выбросов,
+        заполнение категорий и подсчёт числа пропусков.
+        Работает только с application_train и application_test.
+        """
         if self.verbose:
-            print("\nВыполнение очистки данных...")
+            print("\nВыполняется очистка данных...")
 
-        self._remove_redundant_flag_columns()
-        self._convert_days_to_years()
-        self._handle_anomalous_values()
-        self._handle_categorical_missing_values()
-        self._convert_region_ratings_to_categorical()
-        self._add_missing_values_count()
-
-        if self.verbose:
-            print("Очистка данных завершена")
-
-    def _remove_redundant_flag_columns(self):
-        """Удаление FLAG_DOCUMENT столбцов с низкой дисперсией."""
+        # 1) удалить FLAG_DOCUMENT с низкой дисперсией (игнорировать, если отсутствуют)
         flag_cols_to_drop = [
             'FLAG_DOCUMENT_2', 'FLAG_DOCUMENT_4', 'FLAG_DOCUMENT_10',
             'FLAG_DOCUMENT_12', 'FLAG_DOCUMENT_20'
         ]
-        self.application_train = self.application_train.drop(flag_cols_to_drop, axis=1)
-        self.application_test = self.application_test.drop(flag_cols_to_drop, axis=1)
+        self.application_train = self.application_train.drop(columns=flag_cols_to_drop, errors='ignore')
+        self.application_test = self.application_test.drop(columns=flag_cols_to_drop, errors='ignore')
 
-    def _convert_days_to_years(self):
-        """Конвертация дней в годы для возрастных признаков."""
-        self.application_train['DAYS_BIRTH'] = self.application_train['DAYS_BIRTH'] * -1 / 365
-        self.application_test['DAYS_BIRTH'] = self.application_test['DAYS_BIRTH'] * -1 / 365
+        # 2) DAYS_BIRTH -> годы (положительные)
+        if 'DAYS_BIRTH' in self.application_train.columns:
+            self.application_train['DAYS_BIRTH'] = pd.to_numeric(self.application_train['DAYS_BIRTH'], errors='coerce')
+            self.application_train['DAYS_BIRTH'] = self.application_train['DAYS_BIRTH'].apply(lambda x: (-x) / 365 if pd.notna(x) else np.nan)
+        if 'DAYS_BIRTH' in self.application_test.columns:
+            self.application_test['DAYS_BIRTH'] = pd.to_numeric(self.application_test['DAYS_BIRTH'], errors='coerce')
+            self.application_test['DAYS_BIRTH'] = self.application_test['DAYS_BIRTH'].apply(lambda x: (-x) / 365 if pd.notna(x) else np.nan)
 
-    def _handle_anomalous_values(self):
-        """Обработка аномальных значений в dataset."""
-        # Обработка аномального значения в DAYS_EMPLOYED
-        anomalous_value = 365243
-        self.application_train['DAYS_EMPLOYED'] = self.application_train['DAYS_EMPLOYED'].replace(anomalous_value,
-                                                                                                  np.nan)
-        self.application_test['DAYS_EMPLOYED'] = self.application_test['DAYS_EMPLOYED'].replace(anomalous_value, np.nan)
+        # 3) DAYS_EMPLOYED: заменить известную метку аномалии 365243 на NaN
+        for df in (self.application_train, self.application_test):
+            if 'DAYS_EMPLOYED' in df.columns:
+                df['DAYS_EMPLOYED'] = df['DAYS_EMPLOYED'].replace(365243, np.nan)
+                df['DAYS_EMPLOYED'] = pd.to_numeric(df['DAYS_EMPLOYED'], errors='coerce')
+                df['DAYS_EMPLOYED'] = df['DAYS_EMPLOYED'].apply(lambda x: (-x) / 365 if pd.notna(x) else np.nan)
 
-        # Обработка выбросов в социальных кругах
-        obs_columns = ['OBS_30_CNT_SOCIAL_CIRCLE', 'OBS_60_CNT_SOCIAL_CIRCLE']
-        for col in obs_columns:
-            self.application_train.loc[self.application_train[col] > 30, col] = np.nan
-            self.application_test.loc[self.application_test[col] > 30, col] = np.nan
+        # 4) OBS_*: значения > 30 считаем некорректными -> NaN (используем .loc для корректного присваивания)
+        for col in ['OBS_30_CNT_SOCIAL_CIRCLE', 'OBS_60_CNT_SOCIAL_CIRCLE']:
+            if col in self.application_train.columns:
+                self.application_train.loc[self.application_train[col] > 30, col] = np.nan
+            if col in self.application_test.columns:
+                self.application_test.loc[self.application_test[col] > 30, col] = np.nan
 
-        # Удаление строк с невалидным полом
-        self.application_train = self.application_train[self.application_train['CODE_GENDER'] != 'XNA']
+        # 5) удалить строки с CODE_GENDER == 'XNA' в train
+        if 'CODE_GENDER' in self.application_train.columns:
+            self.application_train = self.application_train[self.application_train['CODE_GENDER'] != 'XNA']
 
-    def _handle_categorical_missing_values(self):
-        """Заполнение пропущенных значений в категориальных столбцах."""
-        categorical_columns = self.application_train.select_dtypes(include='object').columns.tolist()
-        self.application_train[categorical_columns] = self.application_train[categorical_columns].fillna('XNA')
-        self.application_test[categorical_columns] = self.application_test[categorical_columns].fillna('XNA')
+        # 6) заполнить категориальные пропуски значением 'XNA' (согласованно для train/test)
+        train_cats = set(self.application_train.select_dtypes(include=['object', 'category']).columns)
+        test_cats = set(self.application_test.select_dtypes(include=['object', 'category']).columns)
+        categorical_columns = sorted(list(train_cats.union(test_cats)))
+        for col in categorical_columns:
+            if col not in self.application_train.columns:
+                self.application_train[col] = 'XNA'
+            if col not in self.application_test.columns:
+                self.application_test[col] = 'XNA'
+            self.application_train[col] = self.application_train[col].fillna('XNA').astype(str)
+            self.application_test[col] = self.application_test[col].fillna('XNA').astype(str)
 
-    def _convert_region_ratings_to_categorical(self):
-        """Конвертация столбцов рейтингов регионов в категориальный тип."""
-        region_columns = ['REGION_RATING_CLIENT', 'REGION_RATING_CLIENT_W_CITY']
-        for col in region_columns:
-            self.application_train[col] = self.application_train[col].astype('object')
-            self.application_test[col] = self.application_test[col].astype('object')
+        # 7) REGION_RATING_*: привести к числу (если собираемся с ними считать)
+        for col in ['REGION_RATING_CLIENT', 'REGION_RATING_CLIENT_W_CITY']:
+            if col in self.application_train.columns:
+                self.application_train[col] = pd.to_numeric(self.application_train[col], errors='coerce')
+            if col in self.application_test.columns:
+                self.application_test[col] = pd.to_numeric(self.application_test[col], errors='coerce')
 
-    def _add_missing_values_count(self):
-        """Добавление подсчета пропущенных значений для каждой строки."""
+        # 8) подсчёт количества пропусков в строке
         self.application_train['MISSING_VALS_TOTAL_APP'] = self.application_train.isna().sum(axis=1)
         self.application_test['MISSING_VALS_TOTAL_APP'] = self.application_test.isna().sum(axis=1)
 
-    def impute_ext_source_features(self):
-        """Импутация пропущенных значений в EXT_SOURCE признаках с помощью XGBoost."""
         if self.verbose:
-            start_time = datetime.now()
-            print("\nИмпутация пропущенных значений EXT_SOURCE...")
+            print("Очистка завершена.")
 
-        # Выбор числовых столбцов для моделирования (исключая целевую и ID столбцы)
-        numeric_columns = self.application_test.select_dtypes(include=[np.number]).columns.tolist()
-        columns_for_modelling = [
-            col for col in numeric_columns
-            if col not in ['EXT_SOURCE_1', 'EXT_SOURCE_2', 'EXT_SOURCE_3', 'SK_ID_CURR', 'TARGET']
-        ]
+    def ext_source_values_predictor(self):
+        """
+        Импутация пропусков в EXT_SOURCE_1/2/3 с помощью XGBRegressor.
+        Использует только числовые колонки, присутствующие и в train, и в test.
+        """
+        if self.verbose:
+            t0 = datetime.now()
+            print("\nИмпутация пропущенных EXT_SOURCE значений...")
 
-        # Сохранение столбцов для будущего использования
-        with open('columns_for_ext_values_predictor.pkl', 'wb') as f:
-            pickle.dump(columns_for_modelling, f)
+        # получить пересечение числовых колонок train/test
+        numeric_train = set(self.application_train.select_dtypes(include=[np.number]).columns.tolist())
+        numeric_test = set(self.application_test.select_dtypes(include=[np.number]).columns.tolist())
+        feature_candidates = sorted(list((numeric_train & numeric_test) - set(['EXT_SOURCE_1', 'EXT_SOURCE_2', 'EXT_SOURCE_3', 'SK_ID_CURR', 'TARGET'])))
 
-        # Импутация EXT_SOURCE столбцов в порядке от наименьших пропусков к наибольшим
+        # сохранить список фичей
+        try:
+            with open('columns_for_ext_values_predictor.pkl', 'wb') as f:
+                pickle.dump(feature_candidates, f)
+        except Exception:
+            pass
+
         for ext_col in ['EXT_SOURCE_2', 'EXT_SOURCE_3', 'EXT_SOURCE_1']:
-            self._impute_single_ext_source(ext_col, columns_for_modelling)
-            columns_for_modelling.append(ext_col)  # Добавление импутированного столбца для следующего предсказания
+            # если столбца нет вообще — пропускаем
+            if ext_col not in self.application_train.columns and ext_col not in self.application_test.columns:
+                continue
+
+            # отфильтровать features, которых действительно нет в df
+            features = [f for f in feature_candidates if f in self.application_train.columns and f in self.application_test.columns]
+            if not features:
+                if self.verbose:
+                    print(f"  Нет общих числовых фичей для моделирования {ext_col}, пропускаем.")
+                continue
+
+            # формируем тренировочные данные (в train те строки, где ext_col не пуст)
+            train_mask = self.application_train[ext_col].notna()
+            X_full = self.application_train.loc[train_mask, features].copy()
+            y_full = pd.to_numeric(self.application_train.loc[train_mask, ext_col], errors='coerce').copy()
+
+            # если мало данных — пропустить
+            if X_full.shape[0] < 50:
+                if self.verbose:
+                    print(f"  Слишком мало данных для обучения модели {ext_col} ({X_full.shape[0]} строк).")
+                continue
+
+            # простая валидация
+            X_tr, X_val, y_tr, y_val = train_test_split(X_full.fillna(X_full.median()), y_full, test_size=0.1, random_state=42)
+
+            model = XGBRegressor(n_estimators=1000, max_depth=3, learning_rate=0.05, n_jobs=-1, random_state=59, verbosity=0)
+            try:
+                model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], early_stopping_rounds=50, verbose=False)
+            except Exception:
+                # fallback
+                model.n_estimators = 200
+                model.fit(X_tr, y_tr)
+
+            # сохранить модель
+            try:
+                with open(f'nan_{ext_col}_xgbr_model.pkl', 'wb') as f:
+                    pickle.dump(model, f)
+            except Exception:
+                pass
+
+            # предсказать и заполнить в train и test (с защитой)
+            # train missing
+            train_missing_idx = self.application_train[self.application_train[ext_col].isna()].index
+            if len(train_missing_idx) > 0:
+                X_train_missing = self.application_train.loc[train_missing_idx, features].fillna(X_full.median())
+                try:
+                    self.application_train.loc[train_missing_idx, ext_col] = model.predict(X_train_missing)
+                except Exception:
+                    pass
+
+            # test missing
+            if ext_col in self.application_test.columns:
+                test_missing_idx = self.application_test[self.application_test[ext_col].isna()].index
+                if len(test_missing_idx) > 0:
+                    X_test_missing = self.application_test.loc[test_missing_idx, features].fillna(X_full.median())
+                    try:
+                        self.application_test.loc[test_missing_idx, ext_col] = model.predict(X_test_missing)
+                    except Exception:
+                        pass
+
+            # добавить предсказанный столбец в кандидаты для следующих итераций
+            if ext_col not in feature_candidates:
+                feature_candidates.append(ext_col)
 
         if self.verbose:
-            print(f"Импутация EXT_SOURCE завершена за {datetime.now() - start_time}")
+            print(f"Импутация EXT_SOURCE завершена за {datetime.now() - t0}")
 
-    def _impute_single_ext_source(self, column_name, feature_columns):
-        """Импутация пропущенных значений для одного EXT_SOURCE столбца."""
-        # Подготовка данных для моделирования
-        train_mask = self.application_train[column_name].notna()
-        X_train = self.application_train.loc[train_mask, feature_columns]
-        y_train = self.application_train.loc[train_mask, column_name]
-
-        X_train_missing = self.application_train.loc[~train_mask, feature_columns]
-        X_test_missing = self.application_test.loc[self.application_test[column_name].isna(), feature_columns]
-
-        # Обучение XGBoost модели
-        xgb_model = XGBRegressor(
-            n_estimators=1000,
-            max_depth=3,
-            learning_rate=0.1,
-            n_jobs=-1,
-            random_state=59
-        )
-        xgb_model.fit(X_train, y_train)
-
-        # Сохранение модели
-        with open(f'nan_{column_name}_xgbr_model.pkl', 'wb') as f:
-            pickle.dump(xgb_model, f)
-
-        # Выполнение предсказаний
-        if not X_train_missing.empty:
-            self.application_train.loc[~train_mask, column_name] = xgb_model.predict(X_train_missing)
-
-        if not X_test_missing.empty:
-            self.application_test.loc[self.application_test[column_name].isna(), column_name] = xgb_model.predict(
-                X_test_missing)
-
-    def create_numeric_features(self, data):
+    def numeric_feature_engineering(self, data):
         """
-        Создание спроектированных числовых признаков на основе предметных знаний.
-
-        Аргументы:
-            data: DataFrame для проектирования признаков
-
-        Возвращает:
-            DataFrame с добавленными признаками
+        Создание числовых признаков (работает с DataFrame, возвращает новый DataFrame).
+        Внутри все преобразования защищены: pd.to_numeric + fillna/epsilon.
         """
-        data = data.copy()
+        df = data.copy()
+        eps = 1e-8
 
-        # Финансовые соотношения и разницы
-        data = self._create_financial_features(data)
+        # приведение базовых колонок к числам (если есть)
+        for col in ['AMT_CREDIT', 'AMT_INCOME_TOTAL', 'AMT_ANNUITY', 'AMT_GOODS_PRICE', 'EXT_SOURCE_1', 'EXT_SOURCE_2', 'EXT_SOURCE_3']:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
 
-        # Возрастные и рабочие признаки
-        data = self._create_demographic_features(data)
+        # финансовые соотношения
+        df['CREDIT_INCOME_RATIO'] = df.get('AMT_CREDIT', 0) / (df.get('AMT_INCOME_TOTAL', 0) + eps)
+        df['CREDIT_ANNUITY_RATIO'] = df.get('AMT_CREDIT', 0) / (df.get('AMT_ANNUITY', 0) + eps)
+        df['ANNUITY_INCOME_RATIO'] = df.get('AMT_ANNUITY', 0) / (df.get('AMT_INCOME_TOTAL', 0) + eps)
+        df['INCOME_ANNUITY_DIFF'] = df.get('AMT_INCOME_TOTAL', 0) - df.get('AMT_ANNUITY', 0)
+        df['CREDIT_GOODS_RATIO'] = df.get('AMT_CREDIT', 0) / (df.get('AMT_GOODS_PRICE', 0) + eps)
+        df['CREDIT_GOODS_DIFF'] = df.get('AMT_CREDIT', 0) - df.get('AMT_GOODS_PRICE', 0)
+        df['GOODS_INCOME_RATIO'] = df.get('AMT_GOODS_PRICE', 0) / (df.get('AMT_INCOME_TOTAL', 0) + eps)
+        df['INCOME_EXT_RATIO'] = df.get('AMT_INCOME_TOTAL', 0) / (df.get('EXT_SOURCE_3', 0) + eps)
+        df['CREDIT_EXT_RATIO'] = df.get('AMT_CREDIT', 0) / (df.get('EXT_SOURCE_3', 0) + eps)
 
-        # Признаки владения автомобилем
-        data = self._create_car_features(data)
+        # возраст и работа (предполагаем, что DAYS_BIRTH и DAYS_EMPLOYED уже в годах после data_cleaning)
+        df['DAYS_BIRTH'] = pd.to_numeric(df.get('DAYS_BIRTH'), errors='coerce')
+        df['DAYS_EMPLOYED'] = pd.to_numeric(df.get('DAYS_EMPLOYED'), errors='coerce')
+        df['AGE_EMPLOYED_DIFF'] = df['DAYS_BIRTH'] - df['DAYS_EMPLOYED']
+        df['EMPLOYED_TO_AGE_RATIO'] = df['DAYS_EMPLOYED'] / (df['DAYS_BIRTH'] + eps)
 
-        # Флаги контактов
-        data = self._create_contact_features(data)
+        if 'AMT_CREDIT' in df.columns and 'HOUR_APPR_PROCESS_START' in df.columns:
+            df['HOUR_PROCESS_CREDIT_MUL'] = df['AMT_CREDIT'] * df['HOUR_APPR_PROCESS_START']
+        else:
+            df['HOUR_PROCESS_CREDIT_MUL'] = 0
 
-        # Семейные признаки
-        data = self._create_family_features(data)
+        # автомобиль
+        df['OWN_CAR_AGE'] = pd.to_numeric(df.get('OWN_CAR_AGE'), errors='coerce')
+        df['CAR_EMPLOYED_DIFF'] = df['OWN_CAR_AGE'] - df.get('DAYS_EMPLOYED', 0)
+        df['CAR_EMPLOYED_RATIO'] = df['OWN_CAR_AGE'] / (df.get('DAYS_EMPLOYED', 0) + eps)
+        df['CAR_AGE_DIFF'] = df.get('DAYS_BIRTH', 0) - df['OWN_CAR_AGE']
+        df['CAR_AGE_RATIO'] = df['OWN_CAR_AGE'] / (df.get('DAYS_BIRTH', 0) + eps)
 
-        # Признаки рейтинга регионов
-        data = self._create_region_features(data)
+        # контакты
+        contact_cols = [c for c in ['FLAG_MOBIL', 'FLAG_EMP_PHONE', 'FLAG_WORK_PHONE', 'FLAG_CONT_MOBILE', 'FLAG_PHONE', 'FLAG_EMAIL'] if c in df.columns]
+        df['FLAG_CONTACTS_SUM'] = df[contact_cols].sum(axis=1) if contact_cols else 0
 
-        # EXT_SOURCE признаки
-        data = self._create_ext_source_features(data)
+        # семья и доход на душу
+        df['CNT_FAM_MEMBERS'] = pd.to_numeric(df.get('CNT_FAM_MEMBERS', 0), errors='coerce').fillna(0)
+        df['CNT_CHILDREN'] = pd.to_numeric(df.get('CNT_CHILDREN', 0), errors='coerce').fillna(0)
+        df['AMT_INCOME_TOTAL'] = pd.to_numeric(df.get('AMT_INCOME_TOTAL', 0), errors='coerce').fillna(0)
+        df['CNT_NON_CHILDREN'] = df['CNT_FAM_MEMBERS'] - df['CNT_CHILDREN']
+        df['CHILDREN_INCOME_RATIO'] = df['CNT_CHILDREN'] / (df['AMT_INCOME_TOTAL'] + eps)
+        df['PER_CAPITA_INCOME'] = df['AMT_INCOME_TOTAL'] / (df['CNT_FAM_MEMBERS'] + 1)
 
-        # Признаки квартир
-        data = self._create_apartment_features(data)
+        # рейтинг региона (числовые уже в data_cleaning)
+        df['REGIONS_RATING_INCOME_MUL'] = ((df.get('REGION_RATING_CLIENT', 0) + df.get('REGION_RATING_CLIENT_W_CITY', 0)) * df.get('AMT_INCOME_TOTAL', 0) / 2)
+        df['REGION_RATING_MAX'] = df[['REGION_RATING_CLIENT', 'REGION_RATING_CLIENT_W_CITY']].max(axis=1)
+        df['REGION_RATING_MIN'] = df[['REGION_RATING_CLIENT', 'REGION_RATING_CLIENT_W_CITY']].min(axis=1)
+        df['REGION_RATING_MEAN'] = (df.get('REGION_RATING_CLIENT', 0) + df.get('REGION_RATING_CLIENT_W_CITY', 0)) / 2
+        df['REGION_RATING_MUL'] = df.get('REGION_RATING_CLIENT', 0) * df.get('REGION_RATING_CLIENT_W_CITY', 0)
 
-        # Признаки социальных кругов
-        data = self._create_social_features(data)
-
-        # Флаги документов
-        data = self._create_document_features(data)
-
-        # Признаки дней
-        data = self._create_days_features(data)
-
-        # Признаки запросов
-        data = self._create_enquiry_features(data)
-
-        return data
-
-    def _create_financial_features(self, data):
-        """Создание финансовых соотношений и разниц."""
-        epsilon = 0.00001  # для избежания деления на ноль
-
-        data['CREDIT_INCOME_RATIO'] = data['AMT_CREDIT'] / (data['AMT_INCOME_TOTAL'] + epsilon)
-        data['CREDIT_ANNUITY_RATIO'] = data['AMT_CREDIT'] / (data['AMT_ANNUITY'] + epsilon)
-        data['ANNUITY_INCOME_RATIO'] = data['AMT_ANNUITY'] / (data['AMT_INCOME_TOTAL'] + epsilon)
-        data['INCOME_ANNUITY_DIFF'] = data['AMT_INCOME_TOTAL'] - data['AMT_ANNUITY']
-        data['CREDIT_GOODS_RATIO'] = data['AMT_CREDIT'] / (data['AMT_GOODS_PRICE'] + epsilon)
-        data['CREDIT_GOODS_DIFF'] = data['AMT_CREDIT'] - data['AMT_GOODS_PRICE']
-        data['GOODS_INCOME_RATIO'] = data['AMT_GOODS_PRICE'] / (data['AMT_INCOME_TOTAL'] + epsilon)
-        data['INCOME_EXT_RATIO'] = data['AMT_INCOME_TOTAL'] / (data['EXT_SOURCE_3'] + epsilon)
-        data['CREDIT_EXT_RATIO'] = data['AMT_CREDIT'] / (data['EXT_SOURCE_3'] + epsilon)
-
-        return data
-
-    def _create_demographic_features(self, data):
-        """Создание возрастных и рабочих признаков."""
-        epsilon = 0.00001
-
-        data['AGE_EMPLOYED_DIFF'] = data['DAYS_BIRTH'] - data['DAYS_EMPLOYED']
-        data['EMPLOYED_TO_AGE_RATIO'] = data['DAYS_EMPLOYED'] / (data['DAYS_BIRTH'] + epsilon)
-        data['HOUR_PROCESS_CREDIT_MUL'] = data['AMT_CREDIT'] * data['HOUR_APPR_PROCESS_START']
-
-        return data
-
-    def _create_car_features(self, data):
-        """Создание признаков владения автомобилем."""
-        epsilon = 0.00001
-
-        data['CAR_EMPLOYED_DIFF'] = data['OWN_CAR_AGE'] - data['DAYS_EMPLOYED']
-        data['CAR_EMPLOYED_RATIO'] = data['OWN_CAR_AGE'] / (data['DAYS_EMPLOYED'] + epsilon)
-        data['CAR_AGE_DIFF'] = data['DAYS_BIRTH'] - data['OWN_CAR_AGE']
-        data['CAR_AGE_RATIO'] = data['OWN_CAR_AGE'] / (data['DAYS_BIRTH'] + epsilon)
-
-        return data
-
-    def _create_contact_features(self, data):
-        """Создание признаков флагов контактов."""
-        contact_columns = [
-            'FLAG_MOBIL', 'FLAG_EMP_PHONE', 'FLAG_WORK_PHONE',
-            'FLAG_CONT_MOBILE', 'FLAG_PHONE', 'FLAG_EMAIL'
-        ]
-        data['FLAG_CONTACTS_SUM'] = data[contact_columns].sum(axis=1)
-        return data
-
-    def _create_family_features(self, data):
-        """Создание семейных признаков."""
-        epsilon = 0.00001
-
-        data['CNT_NON_CHILDREN'] = data['CNT_FAM_MEMBERS'] - data['CNT_CHILDREN']
-        data['CHILDREN_INCOME_RATIO'] = data['CNT_CHILDREN'] / (data['AMT_INCOME_TOTAL'] + epsilon)
-        data['PER_CAPITA_INCOME'] = data['AMT_INCOME_TOTAL'] / (data['CNT_FAM_MEMBERS'] + 1)
-
-        return data
-
-    def _create_region_features(self, data):
-        """Создание признаков рейтинга регионов."""
-        data['REGIONS_RATING_INCOME_MUL'] = (data['REGION_RATING_CLIENT'] + data['REGION_RATING_CLIENT_W_CITY']) * data[
-            'AMT_INCOME_TOTAL'] / 2
-        data['REGION_RATING_MAX'] = data[['REGION_RATING_CLIENT', 'REGION_RATING_CLIENT_W_CITY']].max(axis=1)
-        data['REGION_RATING_MIN'] = data[['REGION_RATING_CLIENT', 'REGION_RATING_CLIENT_W_CITY']].min(axis=1)
-        data['REGION_RATING_MEAN'] = (data['REGION_RATING_CLIENT'] + data['REGION_RATING_CLIENT_W_CITY']) / 2
-        data['REGION_RATING_MUL'] = data['REGION_RATING_CLIENT'] * data['REGION_RATING_CLIENT_W_CITY']
-
-        # Флаги регионов
-        region_flag_columns = [
+        # флаги регионов
+        region_flag_columns = [c for c in [
             'REG_REGION_NOT_LIVE_REGION', 'REG_REGION_NOT_WORK_REGION',
             'LIVE_REGION_NOT_WORK_REGION', 'REG_CITY_NOT_LIVE_CITY',
             'REG_CITY_NOT_WORK_CITY', 'LIVE_CITY_NOT_WORK_CITY'
-        ]
-        data['FLAG_REGIONS'] = data[region_flag_columns].sum(axis=1)
+        ] if c in df.columns]
+        df['FLAG_REGIONS'] = df[region_flag_columns].sum(axis=1) if region_flag_columns else 0
 
-        return data
+        # EXT_SOURCE агрегаты — безопасно
+        ext_cols = [c for c in ['EXT_SOURCE_1', 'EXT_SOURCE_2', 'EXT_SOURCE_3'] if c in df.columns]
+        for c in ext_cols:
+            df[c] = pd.to_numeric(df[c], errors='coerce')
+        if ext_cols:
+            df['EXT_SOURCE_MEAN'] = df[ext_cols].mean(axis=1)
+            if all(c in df.columns for c in ['EXT_SOURCE_1', 'EXT_SOURCE_2', 'EXT_SOURCE_3']):
+                df['EXT_SOURCE_MUL'] = df['EXT_SOURCE_1'] * df['EXT_SOURCE_2'] * df['EXT_SOURCE_3']
+                df['EXT_SOURCE_MAX'] = df[['EXT_SOURCE_1', 'EXT_SOURCE_2', 'EXT_SOURCE_3']].max(axis=1)
+                df['EXT_SOURCE_MIN'] = df[['EXT_SOURCE_1', 'EXT_SOURCE_2', 'EXT_SOURCE_3']].min(axis=1)
+                df['EXT_SOURCE_VAR'] = df[['EXT_SOURCE_1', 'EXT_SOURCE_2', 'EXT_SOURCE_3']].var(axis=1)
+                df['WEIGHTED_EXT_SOURCE'] = df['EXT_SOURCE_1'] * 2 + df['EXT_SOURCE_2'] * 3 + df['EXT_SOURCE_3'] * 4
+        else:
+            df['EXT_SOURCE_MEAN'] = np.nan
 
-    def _create_ext_source_features(self, data):
-        """Создание агрегированных EXT_SOURCE признаков."""
-        data['EXT_SOURCE_MEAN'] = data[['EXT_SOURCE_1', 'EXT_SOURCE_2', 'EXT_SOURCE_3']].mean(axis=1)
-        data['EXT_SOURCE_MUL'] = data['EXT_SOURCE_1'] * data['EXT_SOURCE_2'] * data['EXT_SOURCE_3']
-        data['EXT_SOURCE_MAX'] = data[['EXT_SOURCE_1', 'EXT_SOURCE_2', 'EXT_SOURCE_3']].max(axis=1)
-        data['EXT_SOURCE_MIN'] = data[['EXT_SOURCE_1', 'EXT_SOURCE_2', 'EXT_SOURCE_3']].min(axis=1)
-        data['EXT_SOURCE_VAR'] = data[['EXT_SOURCE_1', 'EXT_SOURCE_2', 'EXT_SOURCE_3']].var(axis=1)
-        data['WEIGHTED_EXT_SOURCE'] = data['EXT_SOURCE_1'] * 2 + data['EXT_SOURCE_2'] * 3 + data['EXT_SOURCE_3'] * 4
+        # ---- АПАРТАМЕНТЫ: безопасное суммирование колонок *_AVG, *_MODE, *_MEDI ----
+        avg_columns = [col for col in df.columns if col.endswith('_AVG')]
+        mode_columns = [col for col in df.columns if col.endswith('_MODE')]
+        medi_columns = [col for col in df.columns if col.endswith('_MEDI')]
 
-        return data
+        def conv_and_filter(frame, cols):
+            """Преобразовать cols в числовые (coerce), отбросить полностью NaN столбцы."""
+            if not cols:
+                return pd.DataFrame(index=frame.index)
+            conv = frame[cols].apply(pd.to_numeric, errors='coerce')
+            conv = conv.dropna(axis=1, how='all')
+            return conv
 
-    def _create_apartment_features(self, data):
-        """Создание признаков квартир."""
-        # AVG столбцы
-        avg_columns = [col for col in data.columns if col.endswith('_AVG')]
-        data['APARTMENTS_SUM_AVG'] = data[avg_columns].sum(axis=1)
-
-        # MODE столбцы
-        mode_columns = [col for col in data.columns if col.endswith('_MODE')]
-        data['APARTMENTS_SUM_MODE'] = data[mode_columns].sum(axis=1)
-
-        # MEDI столбцы
-        medi_columns = [col for col in data.columns if col.endswith('_MEDI')]
-        data['APARTMENTS_SUM_MEDI'] = data[medi_columns].sum(axis=1)
-
-        # Взаимодействия дохода и квартир
-        data['INCOME_APARTMENT_AVG_MUL'] = data['APARTMENTS_SUM_AVG'] * data['AMT_INCOME_TOTAL']
-        data['INCOME_APARTMENT_MODE_MUL'] = data['APARTMENTS_SUM_MODE'] * data['AMT_INCOME_TOTAL']
-        data['INCOME_APARTMENT_MEDI_MUL'] = data['APARTMENTS_SUM_MEDI'] * data['AMT_INCOME_TOTAL']
-
-        return data
-
-    def _create_social_features(self, data):
-        """Создание признаков социальных кругов."""
-        epsilon = 0.00001
-
-        data['OBS_30_60_SUM'] = data['OBS_30_CNT_SOCIAL_CIRCLE'] + data['OBS_60_CNT_SOCIAL_CIRCLE']
-        data['DEF_30_60_SUM'] = data['DEF_30_CNT_SOCIAL_CIRCLE'] + data['DEF_60_CNT_SOCIAL_CIRCLE']
-        data['OBS_DEF_30_MUL'] = data['OBS_30_CNT_SOCIAL_CIRCLE'] * data['DEF_30_CNT_SOCIAL_CIRCLE']
-        data['OBS_DEF_60_MUL'] = data['OBS_60_CNT_SOCIAL_CIRCLE'] * data['DEF_60_CNT_SOCIAL_CIRCLE']
-        data['SUM_OBS_DEF_ALL'] = (data['OBS_30_CNT_SOCIAL_CIRCLE'] + data['DEF_30_CNT_SOCIAL_CIRCLE'] +
-                                   data['OBS_60_CNT_SOCIAL_CIRCLE'] + data['DEF_60_CNT_SOCIAL_CIRCLE'])
-
-        # Соотношения с кредитом
-        data['OBS_30_CREDIT_RATIO'] = data['AMT_CREDIT'] / (data['OBS_30_CNT_SOCIAL_CIRCLE'] + epsilon)
-        data['OBS_60_CREDIT_RATIO'] = data['AMT_CREDIT'] / (data['OBS_60_CNT_SOCIAL_CIRCLE'] + epsilon)
-        data['DEF_30_CREDIT_RATIO'] = data['AMT_CREDIT'] / (data['DEF_30_CNT_SOCIAL_CIRCLE'] + epsilon)
-        data['DEF_60_CREDIT_RATIO'] = data['AMT_CREDIT'] / (data['DEF_60_CNT_SOCIAL_CIRCLE'] + epsilon)
-
-        return data
-
-    def _create_document_features(self, data):
-        """Создание признаков флагов документов."""
-        document_columns = [col for col in data.columns if col.startswith('FLAG_DOCUMENT_')]
-        data['SUM_FLAGS_DOCUMENTS'] = data[document_columns].sum(axis=1)
-        return data
-
-    def _create_days_features(self, data):
-        """Создание признаков дней."""
-        days_columns = ['DAYS_LAST_PHONE_CHANGE', 'DAYS_REGISTRATION', 'DAYS_ID_PUBLISH']
-        data['DAYS_DETAILS_CHANGE_MUL'] = data[days_columns].prod(axis=1)
-        data['DAYS_DETAILS_CHANGE_SUM'] = data[days_columns].sum(axis=1)
-        return data
-
-    def _create_enquiry_features(self, data):
-        """Создание признаков кредитных запросов."""
-        epsilon = 0.00001
-        enquiry_columns = [col for col in data.columns if 'AMT_REQ_CREDIT_BUREAU' in col]
-        data['AMT_ENQ_SUM'] = data[enquiry_columns].sum(axis=1)
-        data['ENQ_CREDIT_RATIO'] = data['AMT_ENQ_SUM'] / (data['AMT_CREDIT'] + epsilon)
-        return data
-
-    def create_knn_target_features(self):
-        """Создание KNN-признаков на основе соседей по целевой переменной."""
-        if self.verbose:
-            print("\nСоздание KNN-признаков на основе целевой переменной...")
-
-        # Подготовка признаков для KNN
-        knn_features = ['EXT_SOURCE_1', 'EXT_SOURCE_2', 'EXT_SOURCE_3', 'CREDIT_ANNUITY_RATIO']
-
-        train_knn_data = self.application_train[knn_features].fillna(0)
-        test_knn_data = self.application_test[knn_features].fillna(0)
-        train_target = self.application_train['TARGET']
-
-        # Обучение KNN модели
-        knn = KNeighborsClassifier(n_neighbors=500, n_jobs=-1)
-        knn.fit(train_knn_data, train_target)
-
-        # Сохранение модели и тренировочных данных
-        with open('KNN_model_TARGET_500_neighbors.pkl', 'wb') as f:
-            pickle.dump(knn, f)
-        with open('TARGET_MEAN_500_Neighbors_training_data.pkl', 'wb') as f:
-            pickle.dump(train_knn_data, f)
-
-        # Получение соседей и расчет среднего таргета
-        train_neighbors = knn.kneighbors(train_knn_data, return_distance=False)
-        test_neighbors = knn.kneighbors(test_knn_data, return_distance=False)
-
-        self.application_train['TARGET_NEIGHBORS_500_MEAN'] = [
-            self.application_train['TARGET'].iloc[indices].mean()
-            for indices in train_neighbors
-        ]
-        self.application_test['TARGET_NEIGHBORS_500_MEAN'] = [
-            self.application_train['TARGET'].iloc[indices].mean()
-            for indices in test_neighbors
-        ]
+        avg_df = conv_and_filter(df, avg_columns)
+        mode_df = conv_and_filter(df, mode_columns)
+        medi_df = conv_and_filter(df, medi_columns)
 
         if self.verbose:
-            print("KNN-признаки созданы")
+            print(f"Числовые AVG: {list(avg_df.columns)}")
+            print(f"Числовые MODE: {list(mode_df.columns)}")
+            print(f"Числовые MEDI: {list(medi_df.columns)}")
 
-    def create_categorical_interactions(self, train_data, test_data):
+        df['APARTMENTS_SUM_AVG'] = avg_df.sum(axis=1) if not avg_df.empty else 0
+        df['APARTMENTS_SUM_MODE'] = mode_df.sum(axis=1) if not mode_df.empty else 0
+        df['APARTMENTS_SUM_MEDI'] = medi_df.sum(axis=1) if not medi_df.empty else 0
+
+        income = pd.to_numeric(df.get('AMT_INCOME_TOTAL', pd.Series(0, index=df.index)), errors='coerce').fillna(0)
+        df['INCOME_APARTMENT_AVG_MUL'] = df['APARTMENTS_SUM_AVG'] * income
+        df['INCOME_APARTMENT_MODE_MUL'] = df['APARTMENTS_SUM_MODE'] * income
+        df['INCOME_APARTMENT_MEDI_MUL'] = df['APARTMENTS_SUM_MEDI'] * income
+
+        # OBS/DEF фичи
+        for c in ['OBS_30_CNT_SOCIAL_CIRCLE', 'OBS_60_CNT_SOCIAL_CIRCLE', 'DEF_30_CNT_SOCIAL_CIRCLE', 'DEF_60_CNT_SOCIAL_CIRCLE']:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors='coerce')
+
+        df['OBS_30_60_SUM'] = df.get('OBS_30_CNT_SOCIAL_CIRCLE', 0) + df.get('OBS_60_CNT_SOCIAL_CIRCLE', 0)
+        df['DEF_30_60_SUM'] = df.get('DEF_30_CNT_SOCIAL_CIRCLE', 0) + df.get('DEF_60_CNT_SOCIAL_CIRCLE', 0)
+        df['OBS_DEF_30_MUL'] = df.get('OBS_30_CNT_SOCIAL_CIRCLE', 0) * df.get('DEF_30_CNT_SOCIAL_CIRCLE', 0)
+        df['OBS_DEF_60_MUL'] = df.get('OBS_60_CNT_SOCIAL_CIRCLE', 0) * df.get('DEF_60_CNT_SOCIAL_CIRCLE', 0)
+        df['SUM_OBS_DEF_ALL'] = (df.get('OBS_30_CNT_SOCIAL_CIRCLE', 0) + df.get('DEF_30_CNT_SOCIAL_CIRCLE', 0) +
+                                 df.get('OBS_60_CNT_SOCIAL_CIRCLE', 0) + df.get('DEF_60_CNT_SOCIAL_CIRCLE', 0))
+        df['OBS_30_CREDIT_RATIO'] = df.get('AMT_CREDIT', 0) / (df.get('OBS_30_CNT_SOCIAL_CIRCLE', 0) + eps)
+        df['OBS_60_CREDIT_RATIO'] = df.get('AMT_CREDIT', 0) / (df.get('OBS_60_CNT_SOCIAL_CIRCLE', 0) + eps)
+        df['DEF_30_CREDIT_RATIO'] = df.get('AMT_CREDIT', 0) / (df.get('DEF_30_CNT_SOCIAL_CIRCLE', 0) + eps)
+        df['DEF_60_CREDIT_RATIO'] = df.get('AMT_CREDIT', 0) / (df.get('DEF_60_CNT_SOCIAL_CIRCLE', 0) + eps)
+
+        # документы
+        flag_doc_cols = [c for c in df.columns if c.startswith('FLAG_DOCUMENT_')]
+        df['SUM_FLAGS_DOCUMENTS'] = df[flag_doc_cols].sum(axis=1) if flag_doc_cols else 0
+
+        # дни подробностей
+        days_cols = [c for c in ['DAYS_LAST_PHONE_CHANGE', 'DAYS_REGISTRATION', 'DAYS_ID_PUBLISH'] if c in df.columns]
+        if days_cols:
+            df['DAYS_DETAILS_CHANGE_MUL'] = df[days_cols].prod(axis=1)
+            df['DAYS_DETAILS_CHANGE_SUM'] = df[days_cols].sum(axis=1)
+        else:
+            df['DAYS_DETAILS_CHANGE_MUL'] = 0
+            df['DAYS_DETAILS_CHANGE_SUM'] = 0
+
+        # запросы в бюро
+        enquiry_cols = [c for c in df.columns if 'AMT_REQ_CREDIT_BUREAU' in c]
+        if enquiry_cols:
+            df['AMT_ENQ_SUM'] = df[enquiry_cols].sum(axis=1)
+            df['ENQ_CREDIT_RATIO'] = df['AMT_ENQ_SUM'] / (df.get('AMT_CREDIT', 0) + eps)
+        else:
+            df['AMT_ENQ_SUM'] = 0
+            df['ENQ_CREDIT_RATIO'] = 0
+
+        return df
+
+    def neighbors_EXT_SOURCE_feature(self, n_neighbors=50):
         """
-        Создание признаков категориальных взаимодействий.
-
-        Аргументы:
-            train_data: Тренировочный DataFrame
-            test_data: Тестовый DataFrame
-
-        Возвращает:
-            Кортеж (train_data, test_data) с добавленными признаками
+        Создаёт признак — средний TARGET по k ближайшим соседям (по EXT_SOURCE_*, CREDIT_ANNUITY_RATIO).
+        Защищено от утечки: при вычислении для train исключаем саму точку.
         """
         if self.verbose:
-            start_time = datetime.now()
-            print("Создание признаков категориальных взаимодействий...")
+            print("\nСоздание KNN-признака на основе EXT_SOURCE и CREDIT_ANNUITY_RATIO...")
 
-        # Определение стратегий группировки
-        grouping_strategies = [
+        base_feats = ['EXT_SOURCE_1', 'EXT_SOURCE_2', 'EXT_SOURCE_3', 'CREDIT_ANNUITY_RATIO']
+        feats = [f for f in base_feats if f in self.application_train.columns and f in self.application_test.columns]
+        if not feats:
+            if self.verbose:
+                print("  Нет необходимых фичей для KNN. Пропускаем.")
+            self.application_train['TARGET_NEIGHBORS_MEAN'] = np.nan
+            self.application_test['TARGET_NEIGHBORS_MEAN'] = np.nan
+            return
+
+        train_X = self.application_train[feats].copy().fillna(self.application_train[feats].median())
+        test_X = self.application_test[feats].copy().fillna(self.application_train[feats].median())
+
+        scaler = StandardScaler()
+        train_scaled = scaler.fit_transform(train_X)
+        test_scaled = scaler.transform(test_X)
+
+        n_train = train_scaled.shape[0]
+        k = min(n_neighbors, max(1, n_train - 1))
+
+        knn = KNeighborsClassifier(n_neighbors=k, n_jobs=-1)
+        knn.fit(train_scaled, self.application_train['TARGET'].values)
+
+        # TRAIN: получить k+1 соседей и удалить саму точку
+        neighs_train = knn.kneighbors(train_scaled, n_neighbors=min(k + 1, n_train), return_distance=False)
+        train_means = []
+        for i, neigh in enumerate(neighs_train):
+            neigh_list = list(neigh)
+            if i in neigh_list:
+                neigh_list.remove(i)
+            else:
+                # если сам отсутствует (маловероятно), обрезаем до k
+                neigh_list = neigh_list[:k]
+            if len(neigh_list) == 0:
+                train_means.append(self.application_train['TARGET'].mean())
+            else:
+                train_means.append(self.application_train['TARGET'].iloc[neigh_list].mean())
+        self.application_train['TARGET_NEIGHBORS_MEAN'] = train_means
+
+        # TEST: взять k соседей из train
+        neighs_test = knn.kneighbors(test_scaled, n_neighbors=k, return_distance=False)
+        test_means = [self.application_train['TARGET'].iloc[inds].mean() for inds in neighs_test]
+        self.application_test['TARGET_NEIGHBORS_MEAN'] = test_means
+
+        try:
+            with open('KNN_model_TARGET_neighbors.pkl', 'wb') as f:
+                pickle.dump(knn, f)
+        except Exception:
+            pass
+
+        if self.verbose:
+            print("KNN-признак создан.")
+
+    def categorical_interaction_features(self, train_data, test_data):
+        """
+        Создание признаков через группировки категориальных колонок (агрегации numeric -> group).
+        Обрабатываются только группы, чьи колонки присутствуют в train.
+        """
+        groups = [
             ['NAME_CONTRACT_TYPE', 'NAME_INCOME_TYPE', 'OCCUPATION_TYPE'],
             ['CODE_GENDER', 'NAME_FAMILY_STATUS', 'NAME_INCOME_TYPE'],
             ['FLAG_OWN_CAR', 'FLAG_OWN_REALTY', 'NAME_INCOME_TYPE'],
@@ -424,7 +444,6 @@ class ApplicationDataPreprocessor:
             ['CODE_GENDER', 'FLAG_OWN_CAR', 'FLAG_OWN_REALTY']
         ]
 
-        # Определение агрегаций
         aggregations = {
             'AMT_ANNUITY': ['mean', 'max', 'min'],
             'ANNUITY_INCOME_RATIO': ['mean', 'max', 'min'],
@@ -438,156 +457,111 @@ class ApplicationDataPreprocessor:
             'EXT_SOURCE_3': ['mean', 'max', 'min']
         }
 
-        # Создание признаков взаимодействий для каждой стратегии группировки
-        for group_cols in grouping_strategies:
-            train_data, test_data = self._create_single_interaction(
-                train_data, test_data, group_cols, aggregations
-            )
+        for group_cols in groups:
+            present = [c for c in group_cols if c in train_data.columns]
+            if not present:
+                continue
 
-        if self.verbose:
-            print(f"Признаки категориальных взаимодействий созданы за {datetime.now() - start_time}")
+            # фильтруем агрегации по наличию колонок
+            available_aggs = {k: v for k, v in aggregations.items() if k in train_data.columns}
+            if not available_aggs:
+                continue
 
-        return train_data, test_data
+            grouped = train_data.groupby(present).agg(available_aggs)
+            # нормализуем имена колонок
+            grouped.columns = [f"{col.upper()}_{agg.upper()}_AGG_{'_'.join(present).upper()}" for col, agg in grouped.columns]
+            grouped = grouped.reset_index()
 
-    def _create_single_interaction(self, train_data, test_data, group_cols, aggregations):
-        """Создание признаков взаимодействий для одной стратегии группировки."""
-        group_name = '_'.join(group_cols)
+            # сохраняем и мержим (join по ключам)
+            try:
+                with open(f'Application_train_grouped_interactions_{"_".join(present)}.pkl', 'wb') as f:
+                    pickle.dump(grouped, f)
+            except Exception:
+                pass
 
-        # Расчет агрегаций на тренировочных данных
-        grouped = train_data.groupby(group_cols).agg(aggregations)
-        grouped.columns = [f'{metric}_{col}_AGG_{group_name}'.upper()
-                           for col, metric in grouped.columns]
-
-        # Сохранение результатов группировки
-        with open(f'Application_train_grouped_interactions_{group_name}.pkl', 'wb') as f:
-            pickle.dump(grouped, f)
-
-        # Объединение с обоими datasets
-        train_data = train_data.merge(grouped, on=group_cols, how='left')
-        test_data = test_data.merge(grouped, on=group_cols, how='left')
+            train_data = train_data.merge(grouped, on=present, how='left')
+            test_data = test_data.merge(grouped, on=present, how='left')
 
         return train_data, test_data
 
-    def encode_categorical_features(self):
-        """Кодирование категориальных признаков с использованием response encoding."""
-        if self.verbose:
-            print("\nКодирование категориальных признаков...")
-
-        categorical_columns = self.application_train.select_dtypes(include='object').columns.tolist()
-
-        for col in categorical_columns:
-            # Создание mapping для response encoding
-            encoding_map = self._create_response_encoding(self.application_train, col)
-
-            # Сохранение mapping
-            with open(f'Response_coding_dict_{col}.pkl', 'wb') as f:
-                pickle.dump(encoding_map, f)
-
-            # Применение encoding к обоим datasets
-            self._apply_response_encoding(self.application_train, col, encoding_map)
-            self._apply_response_encoding(self.application_test, col, encoding_map)
-
-            # Удаление оригинального категориального столбца
-            self.application_train.drop(col, axis=1, inplace=True)
-            self.application_test.drop(col, axis=1, inplace=True)
-
-        if self.verbose:
-            print("Кодирование категориальных признаков завершено")
-
-    def _create_response_encoding(self, data, column):
+    def response_fit(self, data, column):
         """
-        Создание mapping для response encoding категориального столбца.
-
-        Аргументы:
-            data: DataFrame с данными
-            column: Категориальный столбец для кодирования
-
-        Возвращает:
-            Словарь с encoding для каждого класса
+        Response encoding: посчитать частоту категории в классах 0/1.
+        Возвращает словарь {0: {...}, 1: {...}} (в виде долей).
         """
-        encoding_map = {0: {}, 1: {}}
+        mapping = {0: {}, 1: {}}
+        total_counts = data[column].value_counts()
+        for label in [0, 1]:
+            class_counts = data.loc[data['TARGET'] == label, column].value_counts()
+            # безопасно делим: если категории отсутствуют в class_counts, get вернёт 0
+            mapping[label] = (class_counts / total_counts).fillna(0).to_dict()
+        return mapping
 
-        for target_class in [0, 1]:
-            class_data = data[data['TARGET'] == target_class]
-            class_counts = class_data[column].value_counts()
-            total_counts = data[column].value_counts()
-
-            # Расчет вероятности для каждой категории
-            for category in total_counts.index:
-                class_count = class_counts.get(category, 0)
-                encoding_map[target_class][category] = class_count / total_counts[category]
-
-        return encoding_map
-
-    def _apply_response_encoding(self, data, column, encoding_map):
+    def response_transform(self, data, column, dict_mapping):
         """
-        Применение response encoding к столбцу.
-
-        Аргументы:
-            data: DataFrame для кодирования
-            column: Имя столбца для кодирования
-            encoding_map: Словарь mapping для encoding
+        Применяет mapping, создаёт два столбца: {column}_0 и {column}_1.
+        Нераспознанные категории получают NaN -> можно заполнить позже.
         """
-        data[f'{column}_0'] = data[column].map(encoding_map[0])
-        data[f'{column}_1'] = data[column].map(encoding_map[1])
+        data[f'{column}_0'] = data[column].map(dict_mapping.get(0, {}))
+        data[f'{column}_1'] = data[column].map(dict_mapping.get(1, {}))
 
     def main(self):
-        """
-        Выполнение полного пайплайна предобработки.
-
-        Возвращает:
-            Кортеж (обработанные_train_данные, обработанные_test_данные)
-        """
-        # Загрузка данных
+        """Полный pipeline предобработки для application_train и application_test."""
         self.load_dataframes()
-
-        # Очистка данных
         self.data_cleaning()
+        self.ext_source_values_predictor()
 
-        # Импутация EXT_SOURCE признаков
-        self.impute_ext_source_features()
-
-        # Проектирование признаков
         if self.verbose:
-            print("\nНачало проектирования признаков...")
+            t0 = datetime.now()
+            print("\nНачинаем генерацию признаков (numeric)...")
 
-        # Проектирование числовых признаков
-        self.application_train = self.create_numeric_features(self.application_train)
-        self.application_test = self.create_numeric_features(self.application_test)
+        self.application_train = self.numeric_feature_engineering(self.application_train)
+        self.application_test = self.numeric_feature_engineering(self.application_test)
 
-        # KNN-признаки на основе целевой переменной
-        self.create_knn_target_features()
+        # KNN-признак (neighbors)
+        self.neighbors_EXT_SOURCE_feature(n_neighbors=50)
 
-        # Категориальные взаимодействия
-        self.application_train, self.application_test = self.create_categorical_interactions(
-            self.application_train, self.application_test
-        )
-
-        # Кодирование категориальных признаков
-        self.encode_categorical_features()
-
-        # Финальная сводка
         if self.verbose:
-            print('\nПредобработка завершена!')
+            print(f"Numeric features done. Time: {datetime.now() - t0}")
+
+        # categorical interactions
+        if self.verbose:
+            t1 = datetime.now()
+            print("Создание признаков категориальных взаимодействий...")
+        self.application_train, self.application_test = self.categorical_interaction_features(self.application_train, self.application_test)
+        if self.verbose:
+            print(f"Categorical interactions done. Time: {datetime.now() - t1}")
+
+        # response encoding (на основе object колонок, объединение train/test)
+        categorical_columns_application = sorted(list(set(self.application_train.select_dtypes(include=['object']).columns.tolist()) |
+                                                    set(self.application_test.select_dtypes(include=['object']).columns.tolist())))
+        for col in categorical_columns_application:
+            mapping = self.response_fit(self.application_train, col)
+            try:
+                with open(f'Response_coding_dict_{col}.pkl', 'wb') as f:
+                    pickle.dump(mapping, f)
+            except Exception:
+                pass
+            self.response_transform(self.application_train, col, mapping)
+            self.response_transform(self.application_test, col, mapping)
+            # удалить исходный столбец
+            if col in self.application_train.columns:
+                self.application_train.pop(col)
+            if col in self.application_test.columns:
+                self.application_test.pop(col)
+
+        if self.dump_to_pickle:
+            try:
+                with open(self.file_directory + 'application_train_preprocessed.pkl', 'wb') as f:
+                    pickle.dump(self.application_train, f)
+                with open(self.file_directory + 'application_test_preprocessed.pkl', 'wb') as f:
+                    pickle.dump(self.application_test, f)
+            except Exception as e:
+                if self.verbose:
+                    print(f"Ошибка при сохранении pickle: {e}")
+
+        if self.verbose:
+            print("\nПредобработка завершена.")
             print(f"Начальный размер train: {self.initial_shape}")
             print(f"Финальный размер train: {self.application_train.shape}")
-            print(f"Общее время: {datetime.now() - self.start_time}")
-
-        # Сохранение результатов при необходимости
-        if self.dump_to_pickle:
-            self._save_processed_data()
-
         return self.application_train, self.application_test
-
-    def _save_processed_data(self):
-        """Сохранение обработанных данных в pickle файлы."""
-        if self.verbose:
-            print('\nСохранение обработанных данных в pickle файлы...')
-
-        with open(self.file_directory + 'application_train_preprocessed.pkl', 'wb') as f:
-            pickle.dump(self.application_train, f)
-        with open(self.file_directory + 'application_test_preprocessed.pkl', 'wb') as f:
-            pickle.dump(self.application_test, f)
-
-        if self.verbose:
-            print('Данные успешно сохранены!')
