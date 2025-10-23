@@ -47,6 +47,7 @@ class BoostingEnsemble:
         self.num_folds = num_folds
         self.verbose = verbose
         self.save_model = save_model_to_pickle
+        self.models = []
 
         # Инициализация кросс-валидации
         self.stratified_cv = StratifiedKFold(
@@ -100,7 +101,7 @@ class BoostingEnsemble:
                 print(f"\nФолд {fold_num}/{self.num_folds}")
 
             # Обучение и оценка фолда
-            model = self._train_fold(
+            self.model = self._train_fold(
                 train_idx, val_idx, fold_num,
                 verbose_eval, early_stopping_rounds, pickle_suffix
             )
@@ -112,6 +113,27 @@ class BoostingEnsemble:
             self._print_training_completion(start_time)
 
         gc.collect()
+        return self.model
+
+    def predict(self, x_data = None):
+        if x_data is None:
+            x_data = self.x_test
+
+        if not hasattr(self, 'models') or len(self.models) == 0:
+            raise ValueError("Сначала обучите модели")
+
+        all_predictions = []
+        for model in self.models:
+            if self.booster_type == 'xgboost':
+                pred = model.predict_proba(x_data, ntree_limit = model.get_booster().best_ntree_limit)[:, 1]
+            else:
+                pred = model.predict_proba(x_data, num_iteration = model.best_iteration_)[:, 1]
+
+            all_predictions.append(pred)
+
+        avg_preds = np.mean(all_predictions, axis = 0)
+        return self.proba_to_class(avg_preds, self.best_threshold)
+
 
     def _validate_booster_type(self):
         """Проверка корректности типа бустера."""
@@ -139,7 +161,7 @@ class BoostingEnsemble:
             verbose=verbose_eval,
             early_stopping_rounds=early_stopping_rounds
         )
-
+        self.models.append(model)
         # Генерация предсказаний
         self._generate_predictions(model, train_idx, val_idx, fold_num)
 
@@ -462,3 +484,4 @@ class BoostingEnsemble:
         if top_n is None:
             return self.feature_importance
         return self.feature_importance.head(top_n)
+

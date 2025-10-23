@@ -26,7 +26,7 @@ class ApplicationDataPreprocessor:
         - main
     """
 
-    def __init__(self, file_directory='', verbose=True, dump_to_pickle=False):
+    def __init__(self, file_directory='', verbose=True, dump_to_pickle=True):
         """
         Инициализация.
 
@@ -552,9 +552,9 @@ class ApplicationDataPreprocessor:
 
         if self.dump_to_pickle:
             try:
-                with open(self.file_directory + 'application_train_preprocessed.pkl', 'wb') as f:
+                with open("C://Users//User//credit-scoring//data//interim//application_train_preprocessed.pkl", 'wb') as f:
                     pickle.dump(self.application_train, f)
-                with open(self.file_directory + 'application_test_preprocessed.pkl', 'wb') as f:
+                with open("C://Users//User//credit-scoring//data//interim//application_test_preprocessed.pkl", 'wb') as f:
                     pickle.dump(self.application_test, f)
             except Exception as e:
                 if self.verbose:
@@ -564,4 +564,15 @@ class ApplicationDataPreprocessor:
             print("\nПредобработка завершена.")
             print(f"Начальный размер train: {self.initial_shape}")
             print(f"Финальный размер train: {self.application_train.shape}")
+            print(f"Финальный размер test: {self.application_test.shape}")
         return self.application_train, self.application_test
+
+if __name__ == '__main__':
+    file_path = 'C://Users//User//credit-scoring//data//raw//'
+    preprocessor = ApplicationDataPreprocessor(file_directory = file_path)
+    train, test = preprocessor.main()
+    print(type(train))
+
+
+
+
