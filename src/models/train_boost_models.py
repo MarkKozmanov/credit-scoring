@@ -15,13 +15,6 @@ class BoostingEnsemble:
     """
     Комплексный класс для обучения и оценки ансамблевых моделей
     (XGBoost и LightGBM) с кросс-валидацией и детальным анализом.
-
-    Возможности:
-    - Обучение с кросс-валидацией и out-of-fold предсказаниями
-    - Автоматическая оптимизация порога с использованием J-statistic Юдена
-    - Анализ важности признаков
-    - Комплексная визуализация результатов
-    - Поддержка сохранения моделей
     """
 
     def __init__(self, x_train, y_train, x_test, params,
@@ -29,19 +22,9 @@ class BoostingEnsemble:
                  save_model_to_pickle=False):
         """
         Инициализация BoostingEnsemble.
-
-        Args:
-            x_train: Обучающая выборка (DataFrame)
-            y_train: Целевая переменная (Series)
-            x_test: Тестовая выборка (DataFrame)
-            params: Гиперпараметры для ансамблевой модели
-            num_folds: Количество фолдов CV (по умолчанию: 3)
-            random_state: Random state для воспроизводимости (по умолчанию: 33)
-            verbose: Флаг вывода прогресса (по умолчанию: True)
-            save_model_to_pickle: Флаг сохранения моделей (по умолчанию: False)
         """
         self.x_train = x_train
-        self.y_train = y_train
+        self.y_train = y_train.values.ravel() if hasattr(y_train, 'values') else y_train
         self.x_test = x_test
         self.params = params
         self.num_folds = num_folds
@@ -64,7 +47,7 @@ class BoostingEnsemble:
         n_train = self.x_train.shape[0]
         n_test = self.x_test.shape[0]
 
-        self.train_preds_proba = np.zeros(n_train)
+        # Убираем train_preds_proba, так как он некорректно заполняется
         self.cv_preds_proba = np.zeros(n_train)
         self.test_preds_proba = np.zeros(n_test)
         self.best_threshold = 0
@@ -75,16 +58,10 @@ class BoostingEnsemble:
             'gain': np.zeros(len(self.x_train.columns))
         })
 
-    def train(self, booster_type, verbose_eval=400, early_stopping_rounds=200,
+    def train(self, booster_type, verbose_eval=100, early_stopping_rounds=200,
               pickle_suffix=''):
         """
         Обучение бустинговой модели с кросс-валидацией.
-
-        Args:
-            booster_type: Тип модели ('xgboost' или 'lightgbm')
-            verbose_eval: Частота вывода прогресса (по умолчанию: 400)
-            early_stopping_rounds: Количество итераций для ранней остановки (по умолчанию: 200)
-            pickle_suffix: Суффикс для сохраняемых файлов моделей (по умолчанию: '')
         """
         self.booster_type = booster_type.lower()
         self._validate_booster_type()
@@ -92,6 +69,9 @@ class BoostingEnsemble:
         if self.verbose:
             self._print_training_start()
             start_time = datetime.now()
+
+        # Инициализация списка моделей
+        self.models = []
 
         # Выполнение обучения с кросс-валидацией
         for fold_num, (train_idx, val_idx) in enumerate(
@@ -101,10 +81,11 @@ class BoostingEnsemble:
                 print(f"\nФолд {fold_num}/{self.num_folds}")
 
             # Обучение и оценка фолда
-            self.model = self._train_fold(
+            model = self._train_fold(
                 train_idx, val_idx, fold_num,
                 verbose_eval, early_stopping_rounds, pickle_suffix
             )
+            self.models.append(model)
 
         # Пост-обработка результатов
         self._post_process_training()
@@ -113,9 +94,10 @@ class BoostingEnsemble:
             self._print_training_completion(start_time)
 
         gc.collect()
-        return self.model
+        return self.models
 
-    def predict(self, x_data = None):
+    def predict(self, x_data=None):
+        """Предсказание на новых данных."""
         if x_data is None:
             x_data = self.x_test
 
@@ -125,15 +107,22 @@ class BoostingEnsemble:
         all_predictions = []
         for model in self.models:
             if self.booster_type == 'xgboost':
-                pred = model.predict_proba(x_data, ntree_limit = model.get_booster().best_ntree_limit)[:, 1]
+                # Для новых версий XGBoost используем best_iteration
+                if hasattr(model, 'best_iteration') and model.best_iteration is not None:
+                    pred = model.predict_proba(x_data, iteration_range=(0, model.best_iteration))[:, 1]
+                else:
+                    pred = model.predict_proba(x_data)[:, 1]
             else:
-                pred = model.predict_proba(x_data, num_iteration = model.best_iteration_)[:, 1]
+                # Для LightGBM
+                if hasattr(model, 'best_iteration_') and model.best_iteration_ is not None:
+                    pred = model.predict_proba(x_data, num_iteration=model.best_iteration_)[:, 1]
+                else:
+                    pred = model.predict_proba(x_data)[:, 1]
 
             all_predictions.append(pred)
 
-        avg_preds = np.mean(all_predictions, axis = 0)
+        avg_preds = np.mean(all_predictions, axis=0)
         return self.proba_to_class(avg_preds, self.best_threshold)
-
 
     def _validate_booster_type(self):
         """Проверка корректности типа бустера."""
@@ -146,22 +135,33 @@ class BoostingEnsemble:
         print(f"Обучение {self.booster_type} с {self.num_folds}-fold кросс-валидацией")
         print("Использование Out-of-Fold предсказаний для валидации")
 
-    def _train_fold(self, train_idx, val_idx, fold_num, verbose_eval,
-                    early_stopping_rounds, pickle_suffix):
+    def _train_fold(self, train_idx, val_idx, fold_num,
+                    verbose_eval, early_stopping_rounds, pickle_suffix):
         """Обучение одного фолда."""
         # Подготовка данных для фолда
         x_tr, y_tr, x_val, y_val = self._prepare_fold_data(train_idx, val_idx)
 
         # Инициализация и обучение модели
         model = self._initialize_model()
-        model.fit(
-            x_tr, y_tr,
-            eval_set=[(x_tr, y_tr), (x_val, y_val)],
-            eval_metric='auc',
-            verbose=verbose_eval,
-            early_stopping_rounds=early_stopping_rounds
-        )
-        self.models.append(model)
+
+        # Параметры для XGBoost
+        if self.booster_type == 'xgboost':
+            fit_params = {
+                'eval_set': [(x_val, y_val)],
+                'eval_metric': 'auc',
+                'early_stopping_rounds': early_stopping_rounds,
+                'verbose': verbose_eval if self.verbose else False
+            }
+
+        # Параметры для LightGBM (без early stopping в fit)
+        else:
+            fit_params = {
+                'eval_set': [(x_val, y_val)],
+                'eval_metric': 'auc'
+            }
+
+        model.fit(x_tr, y_tr, **fit_params)
+
         # Генерация предсказаний
         self._generate_predictions(model, train_idx, val_idx, fold_num)
 
@@ -177,17 +177,17 @@ class BoostingEnsemble:
     def _prepare_fold_data(self, train_idx, val_idx):
         """Подготовка данных для одного фолда."""
         x_tr = self.x_train.iloc[train_idx]
-        y_tr = self.y_train.iloc[train_idx]
+        y_tr = self.y_train[train_idx]
         x_val = self.x_train.iloc[val_idx]
-        y_val = self.y_train.iloc[val_idx]
+        y_val = self.y_train[val_idx]
         return x_tr, y_tr, x_val, y_val
 
     def _initialize_model(self):
         """Инициализация соответствующей бустинговой модели."""
         if self.booster_type == 'xgboost':
-            return XGBClassifier(**self.params)
+            return XGBClassifier(**self.params, random_state=42)
         else:
-            return LGBMClassifier(**self.params)
+            return LGBMClassifier(**self.params, random_state=42, verbose=-1)
 
     def _generate_predictions(self, model, train_idx, val_idx, fold_num):
         """Генерация предсказаний для текущего фолда."""
@@ -196,100 +196,95 @@ class BoostingEnsemble:
         else:
             self._generate_lightgbm_predictions(model, train_idx, val_idx)
 
-        # Обновление оптимального порога
-        self._update_optimal_threshold(train_idx)
+        # Обновление оптимального порога на ВАЛИДАЦИОННЫХ данных
+        self._update_optimal_threshold(val_idx)
 
     def _generate_xgboost_predictions(self, model, train_idx, val_idx):
         """Генерация предсказаний для XGBoost модели."""
-        ntree_limit = model.get_booster().best_ntree_limit
+        # Для XGBoost используем best_iteration если доступен
+        if hasattr(model, 'best_iteration') and model.best_iteration is not None:
+            predict_params = {'iteration_range': (0, model.best_iteration)}
+        else:
+            predict_params = {}
 
-        # Предсказания на обучающей выборке (усредненные по фолдам)
-        self.train_preds_proba[train_idx] += (
-                model.predict_proba(self.x_train.iloc[train_idx], ntree_limit=ntree_limit)[:, 1]
-                / (self.num_folds - 1)
-        )
-
-        # Валидационные предсказания
-        self.cv_preds_proba[val_idx] = model.predict_proba(
-            self.x_train.iloc[val_idx], ntree_limit=ntree_limit
-        )[:, 1]
+        # Предсказания на валидационной выборке
+        val_preds = model.predict_proba(self.x_train.iloc[val_idx], **predict_params)[:, 1]
+        self.cv_preds_proba[val_idx] = val_preds
 
         # Тестовые предсказания (усредненные по фолдам)
-        self.test_preds_proba += (
-                model.predict_proba(self.x_test, ntree_limit=ntree_limit)[:, 1]
-                / self.num_folds
-        )
+        test_preds = model.predict_proba(self.x_test, **predict_params)[:, 1]
+        self.test_preds_proba += test_preds / self.num_folds
 
     def _generate_lightgbm_predictions(self, model, train_idx, val_idx):
         """Генерация предсказаний для LightGBM модели."""
-        num_iteration = model.best_iteration_
+        # Для LightGBM используем best_iteration_ если доступен
+        predict_params = {}
+        if hasattr(model, 'best_iteration_') and model.best_iteration_ is not None:
+            predict_params['num_iteration'] = model.best_iteration_
 
-        # Предсказания на обучающей выборке (усредненные по фолдам)
-        self.train_preds_proba[train_idx] += (
-                model.predict_proba(self.x_train.iloc[train_idx], num_iteration=num_iteration)[:, 1]
-                / (self.num_folds - 1)
-        )
-
-        # Валидационные предсказания
-        self.cv_preds_proba[val_idx] = model.predict_proba(
-            self.x_train.iloc[val_idx], num_iteration=num_iteration
-        )[:, 1]
+        # Предсказания на валидационной выборке
+        val_preds = model.predict_proba(self.x_train.iloc[val_idx], **predict_params)[:, 1]
+        self.cv_preds_proba[val_idx] = val_preds
 
         # Тестовые предсказания (усредненные по фолдам)
-        self.test_preds_proba += (
-                model.predict_proba(self.x_test, num_iteration=num_iteration)[:, 1]
-                / self.num_folds
-        )
+        test_preds = model.predict_proba(self.x_test, **predict_params)[:, 1]
+        self.test_preds_proba += test_preds / self.num_folds
 
     def _calculate_feature_importance(self, model, fold_num):
         """Расчет важности признаков для текущего фолда."""
-        if self.booster_type == 'xgboost':
-            importance_data = model.get_booster().get_score(importance_type='gain')
-            fold_importance = pd.DataFrame({
-                'features': list(importance_data.keys()),
-                'gain': list(importance_data.values())
-            })
-        else:
-            gain_values = model.booster_.feature_importance(importance_type='gain')
-            fold_importance = pd.DataFrame({
-                'features': self.x_train.columns,
-                'gain': gain_values
-            })
+        try:
+            if self.booster_type == 'xgboost':
+                importance_data = model.get_booster().get_score(importance_type='gain')
+                fold_importance = pd.DataFrame({
+                    'features': list(importance_data.keys()),
+                    'gain': list(importance_data.values())
+                })
+            else:
+                gain_values = model.booster_.feature_importance(importance_type='gain')
+                fold_importance = pd.DataFrame({
+                    'features': self.x_train.columns,
+                    'gain': gain_values
+                })
 
-        # Агрегация важности признаков
-        self.feature_importance = pd.concat([self.feature_importance, fold_importance],
-                                            ignore_index=True)
+            # Агрегация важности признаков
+            self.feature_importance = pd.concat([self.feature_importance, fold_importance],
+                                                ignore_index=True)
+        except Exception as e:
+            if self.verbose:
+                print(f"Ошибка при расчете важности признаков для фолда {fold_num}: {e}")
 
-    def _update_optimal_threshold(self, train_idx):
-        """Обновление оптимального порога с использованием текущего фолда."""
-        y_train_fold = self.y_train.iloc[train_idx]
-        preds_fold = self.train_preds_proba[train_idx]
+    def _update_optimal_threshold(self, val_idx):
+        """Обновление оптимального порога с использованием ВАЛИДАЦИОННЫХ данных."""
+        y_val_fold = self.y_train[val_idx]
+        preds_fold = self.cv_preds_proba[val_idx]
 
-        fold_threshold = self.tune_threshold(y_train_fold, preds_fold)
-        self.best_threshold += fold_threshold / self.num_folds
+        if len(np.unique(y_val_fold)) > 1:  # Проверяем, что есть оба класса
+            fold_threshold = self.tune_threshold(y_val_fold, preds_fold)
+            self.best_threshold += fold_threshold / self.num_folds
 
     def _save_model(self, model, fold_num, pickle_suffix):
         """Сохранение модели в pickle файл."""
         filename = f"model_{self.booster_type}_fold{fold_num}_{pickle_suffix}.pkl"
         with open(filename, 'wb') as f:
             pickle.dump(model, f)
+        if self.verbose:
+            print(f"Модель сохранена: {filename}")
 
     def _post_process_training(self):
         """Пост-обработка результатов обучения."""
         # Обработка важности признаков
-        self.feature_importance = (self.feature_importance
-                                   .groupby('features', as_index=False)
-                                   .mean()
-                                   .sort_values('gain', ascending=False))
+        if not self.feature_importance.empty:
+            self.feature_importance = (self.feature_importance
+                                       .groupby('features', as_index=False)
+                                       .mean()
+                                       .sort_values('gain', ascending=False))
 
         # Конвертация вероятностей в метки классов
         self._convert_probabilities_to_classes()
 
     def _convert_probabilities_to_classes(self):
         """Конвертация вероятностей в метки классов с использованием оптимального порога."""
-        self.train_preds_class = self.proba_to_class(
-            self.train_preds_proba, self.best_threshold
-        )
+        # Используем только OOF предсказания для обучающей выборки
         self.cv_preds_class = self.proba_to_class(
             self.cv_preds_proba, self.best_threshold
         )
@@ -306,43 +301,22 @@ class BoostingEnsemble:
     def proba_to_class(self, probabilities, threshold):
         """
         Конвертация вероятностей в метки классов с использованием порога.
-
-        Args:
-            probabilities: Массив вероятностей
-            threshold: Порог классификации
-
-        Returns:
-            Массив меток классов (0 или 1)
         """
         return (probabilities >= threshold).astype(int)
 
     def tune_threshold(self, true_labels, predicted_probas):
         """
         Поиск оптимального порога с использованием J-statistic Юдена.
-
-        Аргументы:
-            true_labels: Истинные метки классов
-            predicted_probas: Предсказанные вероятности
-
-        Возвращает:
-            Оптимальное значение порога
         """
         fpr, tpr, thresholds = roc_curve(true_labels, predicted_probas)
         j_statistic = tpr - fpr
         best_idx = np.argmax(j_statistic)
-
         return thresholds[best_idx]
 
     def results(self, show_roc_auc=True, show_precision_recall=True,
                 show_confusion_matrix=True, show_distributions=False):
         """
         Отображение комплексных результатов обучения.
-
-        Args:
-            show_roc_auc: Флаг отображения ROC-AUC scores
-            show_precision_recall: Флаг отображения precision/recall scores
-            show_confusion_matrix: Флаг отображения матрицы ошибок
-            show_distributions: Флаг отображения распределений классов
         """
         print("=" * 80)
         print("РЕЗУЛЬТАТЫ ОБУЧЕНИЯ МОДЕЛИ")
@@ -366,19 +340,41 @@ class BoostingEnsemble:
 
     def _print_metrics(self, show_roc_auc, show_precision_recall):
         """Вывод метрик производительности."""
-        # Метрики на обучающей выборке
+        # Метрики на обучающей выборке (предсказания на всех данных)
         print("\nОБУЧАЮЩАЯ ВЫБОРКА:")
+        # Получаем предсказания на всей обучающей выборке
+        train_preds_proba, train_preds_class = self._get_train_predictions()
         self._print_set_metrics(
-            self.y_train, self.train_preds_proba, self.train_preds_class,
+            self.y_train, train_preds_proba, train_preds_class,
             show_roc_auc, show_precision_recall
         )
 
-        # Метрики кросс-валидации
-        print("\nКРОСС-ВАЛИДАЦИЯ:")
+        # Метрики на OOF предсказаниях
+        print("\nOUT-OF-FOLD ПРЕДСКАЗАНИЯ:")
         self._print_set_metrics(
             self.y_train, self.cv_preds_proba, self.cv_preds_class,
             show_roc_auc, show_precision_recall
         )
+
+    def _get_train_predictions(self):
+        """Получение предсказаний на всей обучающей выборке усреднением по всем моделям."""
+        all_train_preds = []
+        for model in self.models:
+            if self.booster_type == 'xgboost':
+                if hasattr(model, 'best_iteration') and model.best_iteration is not None:
+                    pred = model.predict_proba(self.x_train, iteration_range=(0, model.best_iteration))[:, 1]
+                else:
+                    pred = model.predict_proba(self.x_train)[:, 1]
+            else:
+                if hasattr(model, 'best_iteration_') and model.best_iteration_ is not None:
+                    pred = model.predict_proba(self.x_train, num_iteration=model.best_iteration_)[:, 1]
+                else:
+                    pred = model.predict_proba(self.x_train)[:, 1]
+            all_train_preds.append(pred)
+
+        train_preds_proba = np.mean(all_train_preds, axis=0)
+        train_preds_class = self.proba_to_class(train_preds_proba, self.best_threshold)
+        return train_preds_proba, train_preds_class
 
     def _print_set_metrics(self, y_true, y_proba, y_pred,
                            show_roc_auc, show_precision_recall):
@@ -388,8 +384,8 @@ class BoostingEnsemble:
             print(f"  ROC-AUC: {auc_score:.4f}")
 
         if show_precision_recall:
-            precision = precision_score(y_true, y_pred)
-            recall = recall_score(y_true, y_pred)
+            precision = precision_score(y_true, y_pred, zero_division=0)
+            recall = recall_score(y_true, y_pred, zero_division=0)
             print(f"  Precision: {precision:.4f}")
             print(f"  Recall: {recall:.4f}")
 
@@ -411,18 +407,17 @@ class BoostingEnsemble:
 
     def _plot_class_distributions(self):
         """Построение сравнения распределений классов."""
-        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 
-        plots_info = [
-            (self.y_train, 'Исходные данные'),
-            (self.cv_preds_class, 'Предсказания CV'),
-            (self.test_preds_class, 'Тестовые предсказания')
-        ]
+        # Исходное распределение
+        sns.countplot(x=self.y_train, ax=axes[0])
+        axes[0].set_title('Исходное распределение')
+        axes[0].set_xlabel('Класс')
 
-        for idx, (data, title) in enumerate(plots_info):
-            sns.countplot(x=data, ax=axes[idx])
-            axes[idx].set_title(title)
-            axes[idx].set_xlabel('Класс')
+        # OOF предсказания
+        sns.countplot(x=self.cv_preds_class, ax=axes[1])
+        axes[1].set_title('OOF предсказания')
+        axes[1].set_xlabel('Класс')
 
         plt.tight_layout()
         plt.show()
@@ -430,16 +425,12 @@ class BoostingEnsemble:
     def plot_feature_importance(self, num_features=20, figsize=(12, 10)):
         """
         Построение графика важности признаков.
-
-        Args:
-            num_features: Количество топ-признаков для отображения
-            figsize: Размер графика
         """
         # Выбор топ-признаков
         top_features = self.feature_importance.head(num_features)
 
         plt.figure(figsize=figsize)
-        sns.barplot(data=top_features, x='gain', y='features', palette='viridis')
+        sns.barplot(data=top_features, x='gain', y='features', hue='features', palette='viridis', legend=False)
         plt.title(f'Топ {num_features} самых важных признаков', fontsize=16, pad=20)
         plt.xlabel('Важность (gain)', fontsize=12)
         plt.ylabel('Признаки', fontsize=12)
@@ -453,35 +444,51 @@ class BoostingEnsemble:
     def get_predictions(self, dataset_type='test'):
         """
         Получение предсказаний для указанного набора данных.
-
-        Args:
-            dataset_type: 'train', 'cv', или 'test'
-
-        Returns:
-            Кортеж (вероятности, метки_классов)
         """
         predictions_map = {
-            'train': (self.train_preds_proba, self.train_preds_class),
             'cv': (self.cv_preds_proba, self.cv_preds_class),
             'test': (self.test_preds_proba, self.test_preds_class)
         }
 
         if dataset_type not in predictions_map:
-            raise ValueError("dataset_type должен быть 'train', 'cv', или 'test'")
+            raise ValueError("dataset_type должен быть 'cv' или 'test'")
 
         return predictions_map[dataset_type]
 
     def get_feature_importance(self, top_n=None):
         """
         Получение данных о важности признаков.
-
-        Args:
-            top_n: Количество топ-признаков для возврата (None для всех)
-
-        Returns:
-            DataFrame с важностью признаков
         """
         if top_n is None:
             return self.feature_importance
         return self.feature_importance.head(top_n)
+
+if __name__ == "__main__":
+    params = {'num_leaves': np.float64(6.0),
+              'max_depth': 3,
+              'min_split_gain': np.float64(0.1),
+              'min_child_weight': np.float64(4),
+              'min_child_samples': 6,
+              'subsample': np.float64(0.5),
+              'colsample_bytree': np.float64(0.5644927835566099),
+              'reg_alpha': np.float64(0.2709917192816739),
+              'reg_lambda': np.float64(0.1)}
+    params['num_leaves'] = params['num_leaves'].astype('int')
+    X_train = pd.read_csv("C://Users//User//credit-scoring//data//interim//final_train.csv")
+    X_val = pd.read_csv("C://Users//User//credit-scoring//data//interim//final_val_x.csv")
+    y_train = pd.read_csv("C://Users//User//credit-scoring//data//interim//final_train_y.csv")
+    light_boosting = BoostingEnsemble(
+        x_train=X_train,
+        y_train=y_train,
+        x_test=X_val,
+        params=params,
+        save_model_to_pickle=False
+    )
+    light_boosting.train(booster_type='lightgbm')
+
+    # Вывод результатов
+    light_boosting.results()
+
+    # Визуализация важности признаков
+    light_boosting.plot_feature_importance()
 
