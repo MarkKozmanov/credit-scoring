@@ -9,7 +9,7 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import roc_auc_score, precision_score, recall_score, confusion_matrix, roc_curve
 from xgboost import XGBClassifier
 from lightgbm import LGBMClassifier
-
+from sklearn.model_selection import train_test_split
 
 class BoostingEnsemble:
     """
@@ -463,20 +463,86 @@ class BoostingEnsemble:
             return self.feature_importance
         return self.feature_importance.head(top_n)
 
+    def save_final_model(self, model_path: str = None):
+        """Сохранение финальной модели для продакшена"""
+        import os
+
+        if model_path is None:
+            # Создаем папку models если ее нет
+            model_dir = "C:/Users/User/credit-scoring/models"
+            os.makedirs(model_dir, exist_ok=True)
+            model_path = os.path.join(model_dir, "lightgbm_model.pkl")
+        else:
+            # Создаем папку если указан путь
+            os.makedirs(os.path.dirname(model_path), exist_ok=True)
+
+        # Сохраняем первую модель из ансамбля
+        if len(self.models) > 0:
+            with open(model_path, 'wb') as f:
+                pickle.dump(self.models[0], f)
+            print(f"✅ Model saved to {model_path}")
+
+            # Также сохраняем threshold
+            model_info = {
+                'threshold': self.best_threshold,
+                'feature_names': list(self.x_train.columns)
+            }
+            info_path = model_path.replace('.pkl', '_info.pkl')
+            with open(info_path, 'wb') as f:
+                pickle.dump(model_info, f)
+            print(f"✅ Model info saved to {info_path}")
+
+
 if __name__ == "__main__":
-    params = {'num_leaves': np.float64(6.0),
-              'max_depth': 3,
-              'min_split_gain': np.float64(0.1),
-              'min_child_weight': np.float64(4),
-              'min_child_samples': 6,
-              'subsample': np.float64(0.5),
-              'colsample_bytree': np.float64(0.5644927835566099),
-              'reg_alpha': np.float64(0.2709917192816739),
-              'reg_lambda': np.float64(0.1)}
-    params['num_leaves'] = params['num_leaves'].astype('int')
-    X_train = pd.read_csv("C://Users//User//credit-scoring//data//interim//final_train.csv")
+    # Загрузка предобработанных данных и выбранных признаков
+    with open("C:/Users/User/credit-scoring/src/features/selected_features_rfe.pkl", "rb") as f:
+        selected_features = pickle.load(f)
+
+    with open("C:/Users/User/credit-scoring/src/features/application_train_target.pkl", "rb") as f:
+        y_train = pickle.load(f)
+
+    with open("C:/Users/User/credit-scoring/src/features/application_train_preprocessed.pkl", "rb") as f:
+        X_train_full = pickle.load(f)
+
+    # Загрузка валидационной выборки
     X_val = pd.read_csv("C://Users//User//credit-scoring//data//interim//final_val_x.csv")
-    y_train = pd.read_csv("C://Users//User//credit-scoring//data//interim//final_train_y.csv")
+
+    # Выбор только отобранных признаков для train
+    X_train = X_train_full[selected_features]
+
+    # Подготовка валидационной выборки - добавляем отсутствующие признаки
+    missing_features = [f for f in selected_features if f not in X_val.columns]
+    print(f"Отсутствует признаков в val: {len(missing_features)}")
+
+    # Добавляем отсутствующие признаки с нулевыми значениями
+    for feature in missing_features:
+        X_val[feature] = 0
+
+    # Убираем лишние признаки, которых нет в selected_features
+    extra_features = [f for f in X_val.columns if f not in selected_features]
+    if extra_features:
+        print(f"Убираем лишние признаки из val: {len(extra_features)}")
+        X_val = X_val[selected_features]
+
+    # Проверка совпадения признаков
+    print(f"Количество признаков в train: {X_train.shape[1]}")
+    print(f"Количество признаков в val: {X_val.shape[1]}")
+    print(f"Совпадают ли признаки: {list(X_train.columns) == list(X_val.columns)}")
+
+    # Параметры модели
+    params = {
+        'num_leaves': 6,
+        'max_depth': 3,
+        'min_split_gain': 0.1,
+        'min_child_weight': 4,
+        'min_child_samples': 6,
+        'subsample': 0.5,
+        'colsample_bytree': 0.5644927835566099,
+        'reg_alpha': 0.2709917192816739,
+        'reg_lambda': 0.1
+    }
+
+    # Инициализация и обучение модели
     light_boosting = BoostingEnsemble(
         x_train=X_train,
         y_train=y_train,
@@ -491,4 +557,4 @@ if __name__ == "__main__":
 
     # Визуализация важности признаков
     light_boosting.plot_feature_importance()
-
+    light_boosting.save_final_model("C:/Users/User/credit-scoring/models/lightgbm_model.pkl")

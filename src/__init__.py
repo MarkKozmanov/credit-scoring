@@ -8,9 +8,10 @@
 
 from .features import ApplicationDataPreprocessor
 from .models import ModelTuning, BoostingEnsemble
-
+from .inference_pipeline import InferencePreprocessor
 __all__ = [
     "ApplicationDataPreprocessor",
     "ModelTuning",
-    "BoostingEnsemble"
+    "BoostingEnsemble",
+    "InferencePreprocessor"
 ]
